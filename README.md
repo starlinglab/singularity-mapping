@@ -27,3 +27,7 @@ MariaDB [singularity]> SELECT * FROM file_range_car;
 <snip>
 ```
 
+Currently all data is added in a transaction, so if you cancel halfway through the database will
+not be updated.
+
+If you re-run the command new rows will simply be appended, so you should drop the table first.
