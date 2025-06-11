@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"encoding/base32"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -123,12 +124,18 @@ func run(db *sql.DB) error {
 	// TODO: but maybe it's I/O bound?
 
 	numJobs := len(carFileIds)
+
 	// Buffering to allow all jobs to be queued before workers finish
 	jobs := make(chan job, numJobs)
+
 	// No buffering should be necessary because results are processed as they come out
 	// I'll add some buffering just for efficiency
 	// TODO: is this right?
 	results := make(chan result, 5)
+
+	// Count how many jobs have been completed for progress output
+	jobDone := make(chan struct{}, numJobs)
+	jobsDone := 0
 
 	// Launch workers
 	numWorkers := runtime.NumCPU()
@@ -138,7 +145,7 @@ func run(db *sql.DB) error {
 	var wg sync.WaitGroup
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
-		go worker(i, &wg, jobs, results)
+		go worker(i, &wg, jobs, results, jobDone)
 	}
 
 	// Close results channel when all workers are done
@@ -159,7 +166,7 @@ func run(db *sql.DB) error {
 	for result := range results {
 		if result.err != nil {
 			// Stop everything
-			return err
+			return result.err
 		}
 		// Store the mapping between file range ID and car ID
 		_, err = tx.Exec(`
@@ -168,21 +175,44 @@ func run(db *sql.DB) error {
 		if err != nil {
 			return err
 		}
+
+		// Loop over all the job done updates
+		newProgress := false
+	loop:
+		for {
+			select {
+			case <-jobDone:
+				jobsDone++
+				newProgress = true
+			default:
+				// Don't block if no job has completed, just wait for the next result
+				break loop
+			}
+		}
+
+		if newProgress {
+			fmt.Printf("File progress: %d/%d\n", jobsDone, numJobs)
+		}
 	}
 
 	return tx.Commit()
 }
 
-func worker(id int, wg *sync.WaitGroup, jobs <-chan job, results chan<- result) {
+func worker(id int, wg *sync.WaitGroup, jobs <-chan job, results chan<- result, jobDone chan<- struct{}) {
 	defer wg.Done()
 	for j := range jobs {
-		fmt.Printf("worker %d: processing %s\n", id, j.fileName)
 		func() {
 			f, err := os.Open(filepath.Join(carDir, j.fileName))
 			if err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					// A file that can't be found is just a warning
+					fmt.Printf("WARN: worker %d: can't find %s\n", id, j.fileName)
+					return
+				}
 				results <- result{err: err}
 				return
 			}
+			fmt.Printf("worker %d: processing %s\n", id, j.fileName)
 			defer f.Close()
 			rd, err := carv2.NewBlockReader(f)
 			if err != nil {
@@ -207,12 +237,15 @@ func worker(id int, wg *sync.WaitGroup, jobs <-chan job, results chan<- result) 
 
 				// This CAR file contains a CID that matches a file range
 				// So send it off
+				fmt.Printf("worker %d: found CID\n", id)
 				results <- result{
 					fileRangeId: fileRangeId,
 					carId:       j.fileId,
 				}
 			}
 		}()
+		fmt.Printf("worker %d: finished\n", id)
+		jobDone <- struct{}{}
 	}
 }
 
