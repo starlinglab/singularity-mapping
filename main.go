@@ -7,7 +7,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -49,12 +51,24 @@ func main() {
 		panic(err)
 	}
 
-	if err := work(db); err != nil {
+	if err := run(db); err != nil {
 		panic(err)
 	}
 }
 
-func work(db *sql.DB) error {
+type job struct {
+	fileName string
+	fileId   int
+}
+type result struct {
+	fileRangeId int
+	carId       int
+	err         error
+}
+
+var fileRangeIds map[string]int
+
+func run(db *sql.DB) error {
 	tx, err := db.Begin()
 	if err != nil {
 		return err
@@ -63,7 +77,7 @@ func work(db *sql.DB) error {
 
 	// Get all CIDs for the file ranges (1G blocks)
 	// Map CID strings to the id column from file_ranges
-	fileRangeIds := make(map[string]int)
+	fileRangeIds = make(map[string]int)
 
 	rows, err := tx.Query(`SELECT id, cid FROM file_ranges`)
 	if err != nil {
@@ -103,18 +117,77 @@ func work(db *sql.DB) error {
 	}
 
 	// For each CAR check each CID
-	for fileName, fileId := range carFileIds {
-		fmt.Printf("Reading file: %s\n", fileName)
+	// This is done in parallel by workers
+	// There is a fixed number of workers who are fed jobs (CAR names)
+	// This setup assumes the work is CPU bound
+	// TODO: but maybe it's I/O bound?
 
-		err := func() error {
-			f, err := os.Open(filepath.Join(carDir, fileName))
+	numJobs := len(carFileIds)
+	// Buffering to allow all jobs to be queued before workers finish
+	jobs := make(chan job, numJobs)
+	// No buffering should be necessary because results are processed as they come out
+	// I'll add some buffering just for efficiency
+	// TODO: is this right?
+	results := make(chan result, 5)
+
+	// Launch workers
+	numWorkers := runtime.NumCPU()
+	if numWorkers > numJobs {
+		numWorkers = numJobs
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go worker(i, &wg, jobs, results)
+	}
+
+	// Close results channel when all workers are done
+	// This way we can process results later on without having to know how many
+	// results there will be.
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Send jobs
+	for fileName, fileId := range carFileIds {
+		jobs <- job{fileName: fileName, fileId: fileId}
+	}
+	close(jobs)
+
+	// Process results
+	for result := range results {
+		if result.err != nil {
+			// Stop everything
+			return err
+		}
+		// Store the mapping between file range ID and car ID
+		_, err = tx.Exec(`
+			INSERT INTO file_range_car (file_range_id, car_id) VALUES (?, ?)
+			`, result.fileRangeId, result.carId)
+		if err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+func worker(id int, wg *sync.WaitGroup, jobs <-chan job, results chan<- result) {
+	defer wg.Done()
+	for j := range jobs {
+		fmt.Printf("worker %d: processing %s\n", id, j.fileName)
+		func() {
+			f, err := os.Open(filepath.Join(carDir, j.fileName))
 			if err != nil {
-				return err
+				results <- result{err: err}
+				return
 			}
 			defer f.Close()
 			rd, err := carv2.NewBlockReader(f)
 			if err != nil {
-				return err
+				results <- result{err: err}
+				return
 			}
 			for {
 				blk, err := rd.Next()
@@ -122,7 +195,8 @@ func work(db *sql.DB) error {
 					if err == io.EOF {
 						break
 					}
-					return err
+					results <- result{err: err}
+					return
 				}
 
 				fileRangeId, ok := fileRangeIds[blk.Cid().String()]
@@ -131,23 +205,15 @@ func work(db *sql.DB) error {
 					continue
 				}
 
-				// Store the mapping between file range ID and car ID
-				_, err = tx.Exec(`
-					INSERT INTO file_range_car (file_range_id, car_id) VALUES (?, ?)
-					`, fileRangeId, fileId)
-				if err != nil {
-					return err
+				// This CAR file contains a CID that matches a file range
+				// So send it off
+				results <- result{
+					fileRangeId: fileRangeId,
+					carId:       j.fileId,
 				}
 			}
-
-			return nil
 		}()
-		if err != nil {
-			return err
-		}
 	}
-
-	return tx.Commit()
 }
 
 var multibaseBase32 = base32.NewEncoding("abcdefghijklmnopqrstuvwxyz234567").WithPadding(base32.NoPadding)
