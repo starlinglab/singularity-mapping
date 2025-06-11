@@ -237,7 +237,6 @@ func worker(id int, wg *sync.WaitGroup, jobs <-chan job, results chan<- result, 
 
 				// This CAR file contains a CID that matches a file range
 				// So send it off
-				fmt.Printf("worker %d: found CID\n", id)
 				results <- result{
 					fileRangeId: fileRangeId,
 					carId:       j.fileId,
