@@ -1,5 +1,10 @@
 # singularity-mapping
 
+Singularity chops up files into "ranges" of 1G each. This tool looks at the output CAR files
+to see which CAR files contain the file ranges, as matched by CID.
+
+For more info on Singularity CARs, see [NOTES.md](./NOTES.md).
+
 ```
 $ export DATABASE_CONNECTION_STRING="mysql://singularity:your_password_here@tcp(127.0.0.1:3306)/singularity?parseTime=true"
 
