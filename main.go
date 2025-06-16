@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -32,9 +33,11 @@ func main() {
 	connStr := os.Getenv("DATABASE_CONNECTION_STRING")
 	connStr = strings.TrimPrefix(connStr, "mysql://") // singularity connection strings have this
 
+	log.Print("starting")
+
 	db, err := sql.Open("mysql", connStr)
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 	// https://github.com/go-sql-driver/mysql#important-settings
 	db.SetConnMaxLifetime(time.Minute * 3)
@@ -44,17 +47,23 @@ func main() {
 	// TODO: foreign key constraints
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS file_range_car (
-			file_range_id INTEGER,
-			car_id INTEGER
+			file_range_id INTEGER NOT NULL,
+			car_id INTEGER NOT NULL
 		)
 		`)
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 
+	// Assume any errors are due to the index already existing
+	log.Print("creating indexes")
+	db.Exec(`CREATE INDEX idx_file_range_car_file_range_id ON file_range_car(file_range_id)`)
+	db.Exec(`CREATE INDEX idx_file_range_car_car_id ON file_range_car(car_id)`)
+
 	if err := run(db); err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
+	log.Print("done")
 }
 
 type job struct {
@@ -76,11 +85,18 @@ func run(db *sql.DB) error {
 	}
 	defer tx.Rollback()
 
-	// Get all CIDs for the file ranges (1G blocks)
+	// Get CIDs for the file ranges (1G blocks)
 	// Map CID strings to the id column from file_ranges
 	fileRangeIds = make(map[string]int)
 
-	rows, err := tx.Query(`SELECT id, cid FROM file_ranges`)
+	// Only get the file ranges that haven't already been found by this script
+	log.Print("selecting file ranges")
+	rows, err := tx.Query(`
+		SELECT fr.id, fr.cid FROM file_ranges fr
+		WHERE NOT EXISTS (
+			SELECT 1 FROM file_range_car frc
+			WHERE frc.file_range_id = fr.id
+		)`)
 	if err != nil {
 		return err
 	}
@@ -100,7 +116,14 @@ func run(db *sql.DB) error {
 	// Map CAR file names to IDs
 	carFileIds := make(map[string]int)
 
-	rows, err = tx.Query(`SELECT id, storage_path FROM cars`)
+	// Only get CAR files that haven't already been parsed by this script
+	log.Print("selecting cars")
+	rows, err = tx.Query(`
+		SELECT c.id, c.storage_path FROM cars c
+		WHERE NOT EXISTS (
+			SELECT 1 FROM file_range_car frc
+			WHERE frc.car_id = c.id
+		)`)
 	if err != nil {
 		return err
 	}
@@ -121,7 +144,8 @@ func run(db *sql.DB) error {
 	// This is done in parallel by workers
 	// There is a fixed number of workers who are fed jobs (CAR names)
 	// This setup assumes the work is CPU bound
-	// TODO: but maybe it's I/O bound?
+	// But actually it's I/O bound
+	// TODO: try using 2xCPU workers or more
 
 	numJobs := len(carFileIds)
 
@@ -191,10 +215,11 @@ func run(db *sql.DB) error {
 		}
 
 		if newProgress {
-			fmt.Printf("File progress: %d/%d\n", jobsDone, numJobs)
+			log.Printf("file progress: %d/%d\n", jobsDone, numJobs)
 		}
 	}
 
+	log.Print("committing transaction")
 	return tx.Commit()
 }
 
@@ -206,13 +231,13 @@ func worker(id int, wg *sync.WaitGroup, jobs <-chan job, results chan<- result, 
 			if err != nil {
 				if errors.Is(err, os.ErrNotExist) {
 					// A file that can't be found is just a warning
-					fmt.Printf("WARN: worker %d: can't find %s\n", id, j.fileName)
+					log.Printf("WARN: worker %d: can't find %s\n", id, j.fileName)
 					return
 				}
 				results <- result{err: err}
 				return
 			}
-			fmt.Printf("worker %d: processing %s\n", id, j.fileName)
+			log.Printf("worker %d: processing %s\n", id, j.fileName)
 			defer f.Close()
 			rd, err := carv2.NewBlockReader(f)
 			if err != nil {
@@ -243,7 +268,7 @@ func worker(id int, wg *sync.WaitGroup, jobs <-chan job, results chan<- result, 
 				}
 			}
 		}()
-		fmt.Printf("worker %d: finished\n", id)
+		log.Printf("worker %d: finished\n", id)
 		jobDone <- struct{}{}
 	}
 }
